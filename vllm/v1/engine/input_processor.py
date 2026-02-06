@@ -638,9 +638,43 @@ class InputProcessor:
             mm_features = []
             for modality, idx in sorted_mm_idxs:
                 base_mm_hash = decoder_mm_hashes[modality][idx]
+                mm_data = decoder_mm_inputs[modality][idx]
+
+                # Frame-level caching for videos
+                frame_pair_hashes = None
+                use_frame_cache = False
+
+                if modality == "video" and mm_data is not None:
+                    # Check if this is video data with pixel_values
+                    if "pixel_values_videos" in mm_data:
+                        from vllm.multimodal.hasher import MultiModalHasher
+                        from vllm.multimodal.inputs import MultiModalFieldElem
+
+                        try:
+                            pixel_values_field = mm_data["pixel_values_videos"]
+
+                            # Extract actual tensor data from MultiModalFieldElem wrapper
+                            if isinstance(pixel_values_field, MultiModalFieldElem):
+                                pixel_values = pixel_values_field.data
+                            else:
+                                pixel_values = pixel_values_field
+
+                            # Generate frame-pair hashes for caching
+                            frame_pair_hashes, _ = MultiModalHasher.hash_video_frame_pairs(
+                                pixel_values=pixel_values,
+                                temporal_patch_size=2  # For Qwen3-VL
+                            )
+                            use_frame_cache = True
+                            print(f"✅ Generated {len(frame_pair_hashes)} frame-pair hashes for video")
+                        except Exception as e:
+                            # If frame hashing fails, fall back to video-level caching
+                            from vllm.logger import init_logger
+                            logger = init_logger(__name__)
+                            logger.warning(f"Failed to generate frame-pair hashes: {e}")
+
                 mm_features.append(
                     MultiModalFeatureSpec(
-                        data=decoder_mm_inputs[modality][idx],
+                        data=mm_data,
                         modality=modality,
                         identifier=self._get_mm_identifier(
                             base_mm_hash,
@@ -648,6 +682,8 @@ class InputProcessor:
                         ),
                         mm_position=decoder_mm_positions[modality][idx],
                         mm_hash=base_mm_hash,
+                        frame_pair_hashes=frame_pair_hashes,
+                        use_frame_cache=use_frame_cache,
                     )
                 )
 

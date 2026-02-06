@@ -363,6 +363,12 @@ class MultiModalFeatureSpec:
     mm_hash: str | None = None
     """The hash for caching processor outputs (without LoRA prefix)."""
 
+    frame_pair_hashes: list[str] | None = None
+    """List of hashes for each frame-pair in the video"""
+
+    use_frame_cache: bool = False
+    """Whether to use frame-level caching for this item"""
+
     @staticmethod
     def gather_kwargs(features: list["MultiModalFeatureSpec"], keys: set[str]):
         kwargs = defaultdict[str, list[NestedTensors]](list)

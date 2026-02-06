@@ -96,6 +96,9 @@ class EncoderCacheManager:
         If the encoder output was previously not referenced by any request,
         update `freeable` and `num_freeable_slots` accordingly.
 
+        For frame-level caching, returns True if ANY frame-pairs are cached,
+        allowing partial cache hits to be handled by the encoder runner.
+
         Args:
             request: The request containing the multimodal input
             input_id: Index of the multimodal input within the request
@@ -103,7 +106,30 @@ class EncoderCacheManager:
         Returns:
             True if the encoder output for this input is already cached
         """
-        mm_hash = request.mm_features[input_id].identifier
+        mm_feature = request.mm_features[input_id]
+        mm_hash = mm_feature.identifier
+
+        # Frame-level caching check
+        if mm_feature.use_frame_cache and mm_feature.frame_pair_hashes:
+            # Check if ALL frame-pairs are cached
+            all_cached = all(
+                fp_hash in self.cached
+                for fp_hash in mm_feature.frame_pair_hashes
+            )
+
+            if all_cached:
+                # Update reference counts for all frame-pairs
+                for fp_hash in mm_feature.frame_pair_hashes:
+                    if not self.cached[fp_hash]:
+                        num_encoder_embeds = self.freeable.pop(fp_hash)
+                        self.num_freeable_slots -= num_encoder_embeds
+                    self.cached[fp_hash].add(request.request_id)
+                return True
+            else:
+                # Partial cache hit - still needs encoding
+                return False
+
+        # Standard video-level caching
         # Not cached at all
         if mm_hash not in self.cached:
             return False

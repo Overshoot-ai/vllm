@@ -89,6 +89,9 @@ def video_get_metadata(path: str, num_frames: int = -1) -> dict[str, Any]:
     fps = cap.get(cv2.CAP_PROP_FPS)
     duration = total_frames / fps if fps > 0 else 0
 
+    # Save original num_frames to check if user requested all frames
+    requested_all_frames = (num_frames == -1)
+
     if num_frames == -1 or num_frames > total_frames:
         num_frames = total_frames
 
@@ -100,7 +103,8 @@ def video_get_metadata(path: str, num_frames: int = -1) -> dict[str, Any]:
         "frames_indices": list(range(num_frames)),
         # extra field used to control hf processor's video
         # sampling behavior
-        "do_sample_frames": num_frames == total_frames,
+        # When num_frames == -1 (all frames), always set do_sample_frames = False
+        "do_sample_frames": False if requested_all_frames else (num_frames == total_frames),
     }
     return metadata
 

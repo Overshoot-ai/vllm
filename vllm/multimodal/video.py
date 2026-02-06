@@ -331,7 +331,8 @@ class OpenCVVideoBackend(VideoLoader):
             "frames_indices": valid_frame_indices,
             # extra field used to control hf processor's video
             # sampling behavior
-            "do_sample_frames": valid_num_frames == total_frames_num,
+            # When num_frames == -1 (all frames), always set do_sample_frames = False
+            "do_sample_frames": False if num_frames == -1 else (valid_num_frames == total_frames_num),
         }
 
         return frames, metadata
@@ -688,7 +689,8 @@ class Molmo2VideoBackend(VideoLoader):
             frames, valid_num_frames, valid_frame_indices = cls._read_frames(
                 cap, frame_idx_set, total_frames_num, max(frame_idx)
             )
-            do_sample_frames = valid_num_frames == total_frames_num
+            # When num_frames == -1 (all frames), always set do_sample_frames = False
+            do_sample_frames = False if num_frames == -1 else (valid_num_frames == total_frames_num)
             metadata = {
                 "total_num_frames": total_frames_num,
                 "fps": original_fps,

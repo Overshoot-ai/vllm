@@ -1012,8 +1012,8 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         )
 
         if isinstance(video, tuple) and len(video) >= 2 and isinstance(video[1], dict):
-            print("VIDEO METADATA: ", video[1])
             video_metadata = video[1]
+            print("VIDEO METADATA: ", video_metadata)
             self._tracker.video_metadata.append(video_metadata)
             
         return video, uuid

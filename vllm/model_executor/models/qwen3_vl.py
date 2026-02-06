@@ -538,6 +538,9 @@ class Qwen3_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor | list[list[int]],
     ) -> torch.Tensor:
+        print("#########################################################")
+        print(f"VISION ENCODER FORWARD CALLED: {x.shape}, grid_thw: {grid_thw}")
+        print("#########################################################")
         hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         hidden_states = self.patch_embed(hidden_states)
 
@@ -1436,7 +1439,10 @@ class Qwen3VLForConditionalGeneration(
     ) -> tuple[torch.Tensor, ...]:
         grid_thw = video_input["video_grid_thw"]
         assert grid_thw.ndim == 2
-
+        print("#########################################################")
+        print("PROCESS_VIDEO_INPUT CALLED", video_input["type"])
+        print("#########################################################")
+        
         if video_input["type"] == "video_embeds":
             video_embeds = video_input["video_embeds"].type(self.visual.dtype)
         else:
@@ -1893,6 +1899,9 @@ class Qwen3VLForConditionalGeneration(
         return torch.from_numpy(llm_positions), mrope_position_delta
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
+        print("#########################################################")
+        print("EMBED_MULTIMODAL inside the model CALLED")
+        print("#########################################################")
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return None

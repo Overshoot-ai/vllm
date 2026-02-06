@@ -2250,6 +2250,7 @@ class GPUModelRunner(
         list[str],
         list[tuple[str, MultiModalKwargsItem]],
         list[tuple[str, PlaceholderRange]],
+        list["MultiModalFeatureSpec"],
     ]:
         """Batch multimodal inputs from scheduled encoder inputs.
 
@@ -2258,20 +2259,22 @@ class GPUModelRunner(
                 inputs.
 
         Returns:
-            A tuple of (mm_hashes, mm_kwargs, mm_lora_refs) where:
+            A tuple of (mm_hashes, mm_kwargs, mm_lora_refs, mm_features) where:
             - mm_hashes: List of multimodal hashes for each item
             - mm_kwargs: List of multimodal kwargs for each item
             - mm_lora_refs: List of (req_id, placeholder_range) for each item
+            - mm_features: List of MultiModalFeatureSpec for each item
         """
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if not scheduled_encoder_inputs:
-            return [], [], []
+            return [], [], [], []
 
         mm_hashes = list[str]()
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         # Multimodal LoRA reference info to map each multimodal item
         # back to its request & position
         mm_lora_refs = list[tuple[str, PlaceholderRange]]()
+        mm_features = list["MultiModalFeatureSpec"]()
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             req_state = self.requests[req_id]
 
@@ -2283,13 +2286,14 @@ class GPUModelRunner(
                 mm_hashes.append(mm_feature.identifier)
                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
                 mm_lora_refs.append((req_id, mm_feature.mm_position))
+                mm_features.append(mm_feature)
 
-        return mm_hashes, mm_kwargs, mm_lora_refs
+        return mm_hashes, mm_kwargs, mm_lora_refs, mm_features
 
     def _execute_mm_encoder(
         self, scheduler_output: "SchedulerOutput"
     ) -> list[torch.Tensor]:
-        mm_hashes, mm_kwargs, mm_lora_refs = self._batch_mm_inputs_from_scheduler(
+        mm_hashes, mm_kwargs, mm_lora_refs, mm_features = self._batch_mm_inputs_from_scheduler(
             scheduler_output
         )
 
@@ -2368,77 +2372,54 @@ class GPUModelRunner(
                 )
 
         encoder_outputs: list[torch.Tensor] = []
-        # Track the current index in mm_kwargs/mm_lora_refs to map groups to request IDs
-        current_item_idx = 0
-        for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
-            mm_kwargs,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        ):
-            curr_group_outputs: MultiModalEmbeddings
 
-            # EVS-related change.
-            # (ekhvedchenia): Temporary hack to limit peak memory usage when
-            # processing multimodal data. This solves the issue with scheduler
-            # putting too many video samples into a single batch. Scheduler
-            # uses pruned vision tokens count to compare it versus compute
-            # budget which is incorrect (Either input media size or non-pruned
-            # output vision tokens count should be considered)
-            # TODO(ywang96): Fix memory profiling to take EVS into account and
-            # remove this hack.
+        # Process each item individually to support frame-level caching
+        for idx, (modality, mm_kwarg) in enumerate(mm_kwargs):
+            mm_feature = mm_features[idx]
+            mm_hash = mm_hashes[idx]
+
+            # Check if frame-level caching is enabled for this video
             if (
-                self.is_multimodal_pruning_enabled
-                and modality == "video"
-                and num_items > 1
+                modality == "video"
+                and mm_feature.use_frame_cache
+                and mm_feature.frame_pair_hashes
             ):
-                curr_group_outputs_lst = list[torch.Tensor]()
-                for video_idx in range(num_items):
-                    video_mm_kwargs_item = mm_kwargs[current_item_idx + video_idx]
-                    with self.timed_encoder_operation(
-                        should_time, mm_lora_refs, current_item_idx + video_idx, 1
-                    ):
-                        _, _, micro_batch_mm_inputs = next(
-                            group_mm_kwargs_by_modality(
-                                [video_mm_kwargs_item],
-                                device=self.device,
-                                pin_memory=self.pin_memory,
-                            )
-                        )
-
-                        micro_batch_outputs = model.embed_multimodal(
-                            **micro_batch_mm_inputs
-                        )
-
-                        curr_group_outputs_lst.extend(micro_batch_outputs)
-
-                curr_group_outputs = curr_group_outputs_lst
-            else:
-                # Run the encoder.
-                # `curr_group_outputs` is either of the following:
-                # 1. A tensor of shape (num_items, feature_size, hidden_size)
-                # in case feature_size is fixed across all multimodal items.
-                # 2. A list or tuple (length: num_items) of tensors,
-                # each of shape (feature_size, hidden_size) in case the feature
-                # size is dynamic depending on the input multimodal items.
+                logger.info(f"🎯 Frame-level caching enabled for video {idx}")
 
                 with self.timed_encoder_operation(
-                    should_time, mm_lora_refs, current_item_idx, num_items
+                    should_time, mm_lora_refs, idx, 1
                 ):
-                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                    output = self._process_video_with_frame_cache(
+                        model, mm_feature, mm_kwarg, modality
+                    )
 
-            sanity_check_mm_encoder_outputs(
-                curr_group_outputs,
-                expected_num_items=num_items,
-            )
-            encoder_outputs.extend(curr_group_outputs)
+                encoder_outputs.append(output)
+                # Frame-level caching handles caching internally,
+                # but we still cache the full video by mm_hash for backward compat
+                self.encoder_cache[mm_hash] = output
+                logger.debug("Finish execute for mm hash %s (frame-cached)", mm_hash)
+                self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
-            current_item_idx += num_items
+            else:
+                # Standard video-level or image processing
+                with self.timed_encoder_operation(
+                    should_time, mm_lora_refs, idx, 1
+                ):
+                    # Process single item - use group_mm_kwargs_by_modality for proper formatting
+                    _, _, formatted_mm_kwargs = next(
+                        group_mm_kwargs_by_modality(
+                            [(modality, mm_kwarg)],
+                            device=self.device,
+                            pin_memory=self.pin_memory,
+                        )
+                    )
+                    outputs = model.embed_multimodal(**formatted_mm_kwargs)
+                    output = outputs[0]
 
-        # Cache the encoder outputs by mm_hash
-        for mm_hash, output in zip(mm_hashes, encoder_outputs):
-            self.encoder_cache[mm_hash] = output
-            logger.debug("Finish execute for mm hash %s", mm_hash)
-            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+                encoder_outputs.append(output)
+                self.encoder_cache[mm_hash] = output
+                logger.debug("Finish execute for mm hash %s", mm_hash)
+                self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
         return encoder_outputs
 
@@ -6198,6 +6179,179 @@ class GPUModelRunner(
             }
             self.encoder_timing_registry.clear()
             return stats
+
+    def _process_video_with_frame_cache(
+        self,
+        model: "SupportsMultiModal",
+        mm_feature: "MultiModalFeatureSpec",
+        mm_kwarg: MultiModalKwargsItem,
+        modality: str,
+    ) -> torch.Tensor:
+        """Process a video with frame-pair level caching.
+
+        Args:
+            model: The multimodal model
+            mm_feature: Feature spec containing frame_pair_hashes
+            mm_kwarg: The video data kwargs
+            modality: Modality type (should be "video")
+
+        Returns:
+            Full video embedding tensor assembled from cached and newly encoded frame-pairs
+        """
+        frame_pair_hashes = mm_feature.frame_pair_hashes
+        assert frame_pair_hashes is not None, "frame_pair_hashes must be set for frame caching"
+
+        total_pairs = len(frame_pair_hashes)
+
+        # Check cache for each frame-pair
+        cached_embeddings: list[tuple[int, torch.Tensor]] = []
+        uncached_indices: list[int] = []
+
+        for i, fp_hash in enumerate(frame_pair_hashes):
+            if fp_hash in self.encoder_cache:
+                cached_embeddings.append((i, self.encoder_cache[fp_hash]))
+            else:
+                uncached_indices.append(i)
+
+        cached_count = len(cached_embeddings)
+        uncached_count = len(uncached_indices)
+        cache_hit_rate = (cached_count / total_pairs * 100) if total_pairs > 0 else 0
+
+        logger.info(
+            f"📊 Frame-pair cache: {cached_count}/{total_pairs} cached "
+            f"({cache_hit_rate:.1f}% hit rate), {uncached_count} to encode"
+        )
+
+        # If all cached, reassemble and return
+        if not uncached_indices:
+            logger.info("✅ All frame-pairs cached - skipping encoder, reassembling only")
+            sorted_embeddings = [emb for _, emb in sorted(cached_embeddings)]
+            return torch.cat(sorted_embeddings, dim=0)
+
+        # Cache miss - encode FULL video (simpler than partial encoding)
+        logger.info(f"🔄 Cache miss - encoding full video, will cache all {total_pairs} frame-pairs")
+
+        # Run encoder on FULL video
+        _, _, formatted_mm_kwargs = next(
+            group_mm_kwargs_by_modality(
+                [(modality, mm_kwarg)],
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
+        )
+        outputs = model.embed_multimodal(**formatted_mm_kwargs)
+        full_video_output = outputs[0]
+
+        logger.info(f"Encoded full video, output shape: {full_video_output.shape}")
+
+        # Split and cache ALL frame-pair embeddings
+        all_indices = list(range(total_pairs))
+        self._cache_frame_pair_embeddings(
+            full_video_output, all_indices, frame_pair_hashes
+        )
+
+        logger.info(f"✅ Cached all {total_pairs} frame-pairs (had {cached_count} cached before)")
+
+        return full_video_output
+
+    def _extract_uncached_frames(
+        self,
+        mm_kwarg: MultiModalKwargsItem,
+        uncached_indices: list[int],
+        total_pairs: int,
+    ) -> MultiModalKwargsItem:
+        """Extract frame data for uncached frame-pairs only.
+
+        For Qwen3-VL, assumes temporal_patch_size=2 (each frame-pair = 2 frames).
+        """
+        from vllm.multimodal.inputs import MultiModalFieldElem
+
+        temporal_patch_size = 2
+
+        if "pixel_values_videos" in mm_kwarg:
+            pixel_values_field = mm_kwarg["pixel_values_videos"]
+
+            # Unwrap MultiModalFieldElem if needed
+            if isinstance(pixel_values_field, MultiModalFieldElem):
+                pixel_values = pixel_values_field.data
+            else:
+                pixel_values = pixel_values_field
+
+            # Extract frames for uncached pairs
+            uncached_frames = []
+            for idx in uncached_indices:
+                start_frame = idx * temporal_patch_size
+                end_frame = min((idx + 1) * temporal_patch_size, pixel_values.shape[0])
+                uncached_frames.append(pixel_values[start_frame:end_frame])
+
+            uncached_pixel_values = torch.cat(uncached_frames, dim=0)
+
+            # Create new kwargs dict preserving MultiModalFieldElem structure
+            uncached_kwarg = dict(mm_kwarg)
+
+            # Keep the MultiModalFieldElem wrapper but with new data
+            if isinstance(pixel_values_field, MultiModalFieldElem):
+                uncached_kwarg["pixel_values_videos"] = MultiModalFieldElem(
+                    data=uncached_pixel_values,
+                    field=pixel_values_field.field
+                )
+            else:
+                uncached_kwarg["pixel_values_videos"] = uncached_pixel_values
+
+            # Update video_grid_thw if present
+            if "video_grid_thw" in mm_kwarg:
+                grid_thw_field = mm_kwarg["video_grid_thw"]
+
+                # Unwrap if needed
+                if isinstance(grid_thw_field, MultiModalFieldElem):
+                    grid_thw = grid_thw_field.data.clone()
+                    grid_thw[0] = len(uncached_indices) * temporal_patch_size
+                    uncached_kwarg["video_grid_thw"] = MultiModalFieldElem(
+                        data=grid_thw,
+                        field=grid_thw_field.field
+                    )
+                else:
+                    grid_thw = grid_thw_field.clone()
+                    grid_thw[0] = len(uncached_indices) * temporal_patch_size
+                    uncached_kwarg["video_grid_thw"] = grid_thw
+
+            return uncached_kwarg
+
+        # Fallback: return original if format not recognized
+        return mm_kwarg
+
+    def _cache_frame_pair_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        indices: list[int],
+        frame_pair_hashes: list[str],
+    ) -> None:
+        """Split encoder output and cache each frame-pair separately."""
+        num_pairs = len(indices)
+        if num_pairs == 0:
+            return
+
+        # Split embeddings evenly among uncached frame-pairs
+        embeddings_per_pair = embeddings.shape[0] // num_pairs
+
+        for i, pair_idx in enumerate(indices):
+            start_embed = i * embeddings_per_pair
+            end_embed = (i + 1) * embeddings_per_pair if i < num_pairs - 1 else embeddings.shape[0]
+
+            pair_embedding = embeddings[start_embed:end_embed]
+            fp_hash = frame_pair_hashes[pair_idx]
+            self.encoder_cache[fp_hash] = pair_embedding
+
+    def _reassemble_video_embedding(
+        self,
+        frame_pair_hashes: list[str],
+    ) -> torch.Tensor:
+        """Reassemble full video embedding from cached frame-pairs."""
+        embeddings = [
+            self.encoder_cache[fp_hash]
+            for fp_hash in frame_pair_hashes
+        ]
+        return torch.cat(embeddings, dim=0)
 
     @contextmanager
     def timed_encoder_operation(

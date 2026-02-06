@@ -152,3 +152,70 @@ class MultiModalHasher:
                 hasher.update(bytes_)
 
         return hasher.hexdigest()
+
+    @classmethod
+    def hash_frame_pair(cls, frame_data: torch.Tensor, pair_index: int) -> str:
+        """
+        Hash a pair of frames based on pixel content only (position-independent).
+
+        This allows frame-pairs with identical content to match across different
+        videos, even if they appear at different positions. This is essential
+        for caching overlapping video crops.
+
+        Args:
+            frame_data: Tensor containing 2 frames worth of pixel data
+            pair_index: Index of this frame-pair in the video (0, 1, 2, ...)
+                       Currently unused - kept for API compatibility
+
+        Returns:
+            Hex digest hash string
+        """
+        hasher_factory = _get_hasher_factory(envs.VLLM_MM_HASHER_ALGORITHM)
+        hasher = hasher_factory()
+
+        # Hash ONLY pixel data (no position) so identical content matches
+        # across videos regardless of position
+        # Note: pair_index parameter kept for API compatibility but not used
+
+        # Serialize frame data
+        for bytes_ in cls.serialize_item(frame_data):
+            hasher.update(bytes_)
+
+        return hasher.hexdigest()
+
+    @classmethod
+    def hash_video_frame_pairs(
+        cls,
+        pixel_values: torch.Tensor,
+        temporal_patch_size: int = 2
+    ) -> tuple[list[str], str]:
+        """
+        Generate frame-pair hashes for a video.
+
+        Args:
+            pixel_values: Video frames tensor (num_frames, ...)
+            temporal_patch_size: Number of frames per pair
+
+        Returns:
+            - List of frame-pair hashes (one per pair)
+            - Composite video hash (for backward compatibility)
+        """
+        num_frames = pixel_values.shape[0]
+        num_pairs = (num_frames + temporal_patch_size - 1) // temporal_patch_size
+
+        frame_pair_hashes = []
+        for i in range(num_pairs):
+            start_idx = i * temporal_patch_size
+            end_idx = min((i + 1) * temporal_patch_size, num_frames)
+            frame_pair = pixel_values[start_idx:end_idx]
+
+            pair_hash = cls.hash_frame_pair(frame_pair, i)
+            frame_pair_hashes.append(pair_hash)
+
+        # Composite hash for backward compatibility
+        composite_hash = cls.hash_kwargs(
+            frame_pair_hashes=frame_pair_hashes,
+            num_frames=num_frames
+        )
+
+        return frame_pair_hashes, composite_hash
